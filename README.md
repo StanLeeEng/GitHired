@@ -1,3 +1,2 @@
 # GitHired
-
-# Streamlines job-application process
+Streamlines the job-application process
