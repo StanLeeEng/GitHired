@@ -1,0 +1,323 @@
+Job Tracker Design Document | Page 1
+GitHub Job Tracker
+Technical Design Document
+Version 1.0 | February 2026
+1. Project Overview
+GitHub Job Tracker is a lightweight personal web application that monitors GitHub repositories
+containing job listings (such as SimplifyJobs/New-Grad-Positions) and sends real-time
+notifications whenever new postings are added. The app scrapes structured job data from
+repository README files, stores previously seen listings in a local database, and delivers alerts
+via Telegram. A Flask-based web dashboard provides visibility into recent listings and system
+status.
+This document covers the full technical design: architecture, data model, component
+breakdown, API contracts, scheduling strategy, notification flow, and deployment approach.
+2. Goals & Non-Goals
+2.1 Goals
+• Monitor one or more GitHub repositories for new job postings on a configurable interval
+• Parse markdown tables from README files into structured job records
+• Persist seen listings to avoid duplicate notifications across restarts
+• Send formatted Telegram notifications for each new posting
+• Expose a simple Flask dashboard to browse recent listings and system health
+• Keep the stack minimal: Python, Flask, SQLite, APScheduler, Requests
+2.2 Non-Goals
+• Multi-user support or authentication (this is a single-user personal tool)
+• Support for job boards other than GitHub-hosted markdown repos (for now)
+• Full-text search or advanced filtering beyond keyword matching
+• Email or Slack notification channels (Telegram only in v1)
+Job Tracker Design Document | Page 2
+• A mobile app or browser extension
+3. System Architecture
+The application is a single Python process with four logical layers that communicate in a linear
+pipeline: Scheduler triggers the Scraper, the Scraper feeds the Deduplication Engine, and new
+records are handed off to the Notification Service. The Flask web server runs concurrently as a
+read-only view into the same database.
+3.1 Component Diagram
+ +------------------+ HTTP/API +-------------------+
+ | APScheduler | ───────────────> | GitHub API |
+ | (every 30 min) | | (README content) |
+ +--------+---------+ +-------------------+
+ |
+ v
+ +------------------+
+ | Scraper | Fetches + parses README markdown table
+ +--------+---------+
+ |
+ v
+ +------------------+
+ | Deduplicator | Compares against SQLite, finds new jobs
+ +--------+---------+
+ | new jobs only
+ +------+------+
+ | |
+ v v
+ +------+ +----------+
+ | DB | | Notifier | Sends Telegram message per new job
+ |SQLite| +----------+
+ +------+
+ ^
+ | read-only
+ +--------+
+ | Flask | Dashboard at / and /jobs
+ +--------+
+3.2 Key Design Decisions
+• Single process: APScheduler runs inside the same process as Flask using
+BackgroundScheduler. No separate worker process or message queue is needed at this
+scale.
+• SQLite over PostgreSQL: The app is single-user and single-process. SQLite requires no
+setup and is reliable for this read/write volume.
+Job Tracker Design Document | Page 3
+• GitHub REST API over HTML scraping: The API returns stable JSON with base64-
+encoded file content, making it far more reliable than parsing raw HTML which changes
+without notice.
+• Stateless scraper: The scraper function is pure -- it takes no arguments beyond config
+and returns a list of job dicts. This makes it easy to test and replace.
+4. Technology Stack
+Component Technology Rationale
+Web framework Flask 3.x Lightweight, minimal boilerplate, good
+ecosystem
+Database SQLite via sqlite3 stdlib No setup, single-user, sufficient for
+volume
+Scheduler APScheduler 3.x
+(BackgroundScheduler)
+Runs in-process alongside Flask, no
+Redis needed
+HTTP client requests Simple, battle-tested, no async
+complexity needed
+HTML parsing (fallback) BeautifulSoup4 Only used if GitHub API is unavailable
+Notifications Telegram Bot API (via
+requests)
+Instant, free, no library needed beyond
+requests
+Config management python-dotenv Loads secrets from .env, never
+hardcoded
+Testing pytest Standard Python test framework
+Deployment Railway or Render (free tier) Persistent process, environment variable
+support
+Full requirements.txt:
+flask>=3.0
+requests>=2.31
+apscheduler>=3.10
+python-dotenv>=1.0
+beautifulsoup4>=4.12 # optional fallback
+pytest>=7.0 # dev dependency
+5. Project Structure
+job-tracker/
+Job Tracker Design Document | Page 4
+├── app/
+│ ├── __init__.py # create_app() factory
+│ ├── config.py # Config class, loads .env
+│ ├── db.py # Database init and helpers
+│ ├── scraper.py # GitHub API fetch + markdown parser
+│ ├── notifier.py # Telegram notification logic
+│ ├── scheduler.py # APScheduler setup and job definition
+│ ├── routes.py # Flask routes (dashboard, jobs API)
+│ └── templates/
+│ ├── base.html
+│ ├── index.html # Dashboard
+│ └── jobs.html # Job listings table
+├── tests/
+│ ├── test_scraper.py
+│ ├── test_deduplication.py
+│ └── fixtures/
+│ └── sample_readme.md
+├── .env.example
+├── requirements.txt
+├── run.py # Entry point
+└── README.md
+6. Data Model
+6.1 Jobs Table
+The primary table stores all job listings that have been observed, along with notification status.
+CREATE TABLE IF NOT EXISTS jobs (
+ id TEXT PRIMARY KEY, -- MD5 hash of
+company|role|location
+ company TEXT NOT NULL,
+ role TEXT NOT NULL,
+ location TEXT,
+ link TEXT,
+ repo TEXT NOT NULL, -- e.g. 'SimplifyJobs/New-GradPositions'
+ notified INTEGER DEFAULT 0, -- 0 = pending, 1 = sent
+ seen_at TEXT NOT NULL, -- ISO 8601 timestamp
+ notified_at TEXT -- NULL until notification sent
+);
+6.2 Repos Table
+Stores the list of repositories being monitored. This allows the dashboard to add or remove
+repos without code changes.
+CREATE TABLE IF NOT EXISTS repos (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ owner TEXT NOT NULL, -- e.g. 'SimplifyJobs'
+Job Tracker Design Document | Page 5
+ name TEXT NOT NULL, -- e.g. 'New-Grad-Positions'
+ active INTEGER DEFAULT 1, -- 0 = paused
+ added_at TEXT NOT NULL
+);
+6.3 Run Log Table
+Tracks each scheduler run for debugging and dashboard display.
+CREATE TABLE IF NOT EXISTS run_log (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ repo TEXT NOT NULL,
+ ran_at TEXT NOT NULL,
+ jobs_found INTEGER DEFAULT 0,
+ jobs_new INTEGER DEFAULT 0,
+ status TEXT, -- 'success' | 'error'
+ error_msg TEXT -- NULL on success
+);
+7. Component Details
+7.1 Scraper (app/scraper.py)
+Responsible for fetching the README from GitHub and parsing the markdown table into a list of
+job dictionaries.
+Fetching the README
+Use the GitHub Contents API to retrieve the README as base64-encoded content. This is
+preferred over raw HTML scraping because the response is stable JSON.
+GET https://api.github.com/repos/{owner}/{repo}/contents/README.md
+Headers:
+ Authorization: Bearer {GITHUB_TOKEN}
+ Accept: application/vnd.github+json
+Response: { content: '<base64>', encoding: 'base64', ... }
+Parsing the Markdown Table
+The Simplify README contains one or more pipe-delimited markdown tables. The parser splits
+on newlines, detects table rows by the leading pipe character, skips separator rows (containing -
+--), skips the header row, and maps columns positionally to job fields. The column order in the
+Simplify repos is: Company, Role, Location, Application Link, Date Added.
+Job Tracker Design Document | Page 6
+Each job is assigned a stable ID using MD5(company|role|location) so that jobs can be uniquely
+identified even if the link or date changes. This prevents false-positive "new job" detections on
+minor edits.
+7.2 Deduplication Engine (app/db.py)
+After the scraper returns a list of job dicts, the deduplication step filters out any jobs already
+present in the database. Only new jobs are returned to the caller for notification and insertion.
+def find_new_jobs(jobs: list[dict], conn) -> list[dict]:
+ new = []
+ for job in jobs:
+ row = conn.execute(
+ 'SELECT id FROM jobs WHERE id = ?', (job['id'],)
+ ).fetchone()
+ if row is None:
+ new.append(job)
+ return new
+7.3 Notification Service (app/notifier.py)
+Sends a formatted Telegram message for each new job. Each message includes the company
+name, role, location, and a direct application link. Messages use Telegram's Markdown mode
+for basic formatting.
+Telegram message format:
+ New Job Posted
+ Company: Google
+ Role: Software Engineer, New Grad
+ Location: New York, NY
+ Apply: https://careers.google.com/...
+The notifier updates the jobs table after each successful send, setting notified=1 and notified_at
+to the current timestamp. If the Telegram API returns an error, the job remains in notified=0
+state and will be retried on the next run.
+7.4 Scheduler (app/scheduler.py)
+APScheduler's BackgroundScheduler is started inside the Flask application factory when the
+app initializes. It runs the check_and_notify job on a configurable interval (default 30 minutes).
+def start_scheduler(app):
+ scheduler = BackgroundScheduler()
+ scheduler.add_job(
+ func=lambda: check_all_repos(app),
+ trigger='interval',
+ minutes=app.config['CHECK_INTERVAL_MINUTES'],
+ id='job_check',
+ replace_existing=True
+ )
+Job Tracker Design Document | Page 7
+ scheduler.start()
+ return scheduler
+The lambda captures the app context so that db.py and notifier.py can access Flask's
+application context inside the background thread. A try/except around the job body logs errors to
+run_log without crashing the scheduler.
+7.5 Flask Routes (app/routes.py)
+Route Method Description
+ / GET Dashboard: last 5 runs, total jobs seen, notification count
+ /jobs GET Paginated table of all jobs with filters for company/role/location
+ /jobs/new GET Jobs seen in the last 24 hours
+ /repos GET List of monitored repositories and their status
+ /run POST Manually trigger a scrape run (useful during development)
+ /health GET JSON health check: { status, last_run, jobs_total }
+8. Configuration
+All secrets and environment-specific values are loaded from a .env file using python-dotenv. A
+.env.example file is committed to the repo with placeholder values.
+# .env.example
+# GitHub API
+GITHUB_TOKEN=ghp_your_personal_access_token
+# Telegram Bot
+TELEGRAM_BOT_TOKEN=1234567890:ABCdef...
+TELEGRAM_CHAT_ID=your_numeric_chat_id
+# Scheduler
+CHECK_INTERVAL_MINUTES=30
+# Flask
+FLASK_SECRET_KEY=change_me_in_production
+FLASK_ENV=development
+# Database
+DATABASE_PATH=jobs.db
+The config.py class reads these variables at startup and raises a clear error if required values
+are missing, preventing silent failures in production.
+Job Tracker Design Document | Page 8
+9. Error Handling & Resilience
+• GitHub API failures: If the API returns a non-200 response, the run is logged as an error
+in run_log and the scheduler continues. The next run will retry normally.
+• Markdown parsing failures: If no table rows are parsed from a README, the run logs a
+warning but does not raise. This avoids marking all existing jobs as "new" due to a
+parsing bug.
+• Telegram API failures: If a notification fails to send, the job remains notified=0 and will be
+retried on the next run. After 3 consecutive failures, a warning is logged.
+• Rate limiting: GitHub allows 5,000 API requests/hour with a token. At 30-minute intervals
+monitoring 5 repos, this app uses roughly 10 requests/hour -- well within limits. A RetryAfter header check is implemented as a safeguard.
+• Scheduler crashes: APScheduler is configured with a thread pool executor. An
+unhandled exception in one job execution does not kill the scheduler.
+10. Testing Strategy
+10.1 Unit Tests
+• test_scraper.py: Test the markdown parser against a fixture README with known rows.
+Assert correct field extraction, correct deduplication IDs, and graceful handling of
+malformed rows.
+• test_deduplication.py: Test find_new_jobs with an in-memory SQLite database. Assert
+that already-seen jobs are filtered out and only genuinely new ones are returned.
+• test_notifier.py: Mock the requests.post call to Telegram and verify message format, that
+notified flag is updated after success, and that failures don't raise unhandled exceptions.
+10.2 Integration Tests
+A single integration test in test_integration.py spins up the Flask app in testing mode, seeds the
+database with a sample README fixture, calls the /run endpoint, and asserts that new jobs
+appear in the database and the run_log shows a success entry. Telegram calls are mocked.
+11. Deployment
+11.1 Local Development
+python -m venv venv
+Job Tracker Design Document | Page 9
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env # fill in your values
+python run.py
+11.2 Production (Railway or Render)
+• Push the repo to GitHub.
+• Connect the repo to Railway or Render and create a new web service.
+• Set all environment variables from .env in the platform's dashboard (never commit
+secrets).
+• Set the start command to: python run.py
+• Railway and Render both persist the filesystem between deploys on their paid tiers. On
+free tiers, use a persistent volume mount for jobs.db or switch DATABASE_PATH to a
+mounted path.
+11.3 Persistence Consideration
+SQLite writes to the local filesystem. On platforms that reset the filesystem on each deploy (like
+Render's free tier), the database will be lost. The simplest solution for a personal tool is to either
+upgrade to a paid tier with persistent disks, or switch to a free hosted PostgreSQL instance
+(Railway and Render both offer these). The application code change is minimal -- swap the
+sqlite3 calls for psycopg2 or use SQLAlchemy as an abstraction layer.
+12. Future Enhancements
+The following features are out of scope for v1 but are straightforward to add:
+• Keyword filtering: Add an include_keywords and exclude_keywords config so only
+relevant roles trigger notifications (e.g., only notify for roles containing "backend" or
+"data").
+• Multiple notification channels: Abstract the notifier behind an interface so that email
+(SendGrid) or Slack webhook support can be added alongside Telegram.
+• Web-based repo management: A /repos/add form in the dashboard to add new repos
+without editing the database directly.
+• Duplicate detection improvements: Use fuzzy matching (via rapidfuzz) to catch nearduplicate job titles that differ only in punctuation or whitespace.
+• Dockerfile: A simple Dockerfile would make deployment to any VPS or container
+platform trivial and self-contained.
+Appendix: Useful GitHub API Endpoints
+Job Tracker Design Document | Page 10
+Endpoint Use Case
+GET /repos/{owner}/{repo}/contents/README.md Fetch README as base64 content
+GET /repos/{owner}/{repo}/commits Check if repo has been updated since last run
+GET /repos/{owner}/{repo} Repo metadata: stars, last push timestamp
+GET /rate_limit Check remaining API quota before running
+scraper
+End of Document
